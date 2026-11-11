@@ -12,18 +12,18 @@ import {
   Unlock, Wifi, WifiOff, X, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import {
-  addFrame, addLayer, appendStroke, createProject, HEIGHT, removeFrame, renderProject,
+  addFrame, addLayer, appendStroke, createProject, drawStroke, HEIGHT, removeFrame, renderProject,
   sampleColor, undoStroke, WIDTH,
   type Point, type Project, type Stroke, type Tool,
 } from './engine'
 
 type Role = 'pc' | 'phone' | null
-type Status = 'idle' | 'creating' | 'ready' | 'connecting' | 'waiting' | 'connected' | 'error'
+type Status = 'idle' | 'creating' | 'ready' | 'connecting' | 'waiting' | 'connected' | 'reconnecting' | 'error'
 type Action =
   | { type: 'set'; key: 'name' | 'fps' | 'onion' | 'grid' | 'background' | 'activeFrame' | 'activeLayer'; value: string | number | boolean }
-  | { type: 'newFrame'; duplicate: boolean }
+  | { type: 'newFrame'; duplicate: boolean; id?: string }
   | { type: 'deleteFrame' }
-  | { type: 'newLayer' }
+  | { type: 'newLayer'; id?: string }
   | { type: 'updateLayer'; id: string; key: 'name' | 'visible' | 'locked'; value: string | boolean }
   | { type: 'undo' }
   | { type: 'redo' }
@@ -31,11 +31,15 @@ type Action =
   | { type: 'replace'; project: Project }
 
 type Wire =
-  | { type: 'sync'; project: Project }
-  | { type: 'action'; action: Action }
+  | { type: 'sync'; project: Project; version: number; accepted: string[]; resumeToken: string }
+  | { type: 'action'; id: string; action: Action }
+  | { type: 'commit'; version: number; action: Action }
+  | { type: 'ack'; id: string; version: number }
+  | { type: 'requestSync' }
   | { type: 'start'; frame: number; layer: string; stroke: Stroke }
-  | { type: 'point'; point: Point }
+  | { type: 'points'; strokeId: string; points: Point[] }
   | { type: 'cancel' }
+  | { type: 'ping' | 'pong' }
 
 const STORAGE = 'frame-studio-autosave-v1'
 const PRESETS = ['#20243c', '#ffffff', '#ef5d6d', '#ffb55a', '#e9ce64', '#6bd5b3', '#5aa5ef', '#9b83f2']
@@ -98,9 +102,9 @@ function applyBasicAction(doc: Project, action: Action): Project {
       if (action.key === 'grid' || action.key === 'onion') return { ...doc, [action.key]: Boolean(action.value) }
       return doc
     }
-    case 'newFrame': return addFrame(doc, action.duplicate)
+    case 'newFrame': return addFrame(doc, action.duplicate, action.id)
     case 'deleteFrame': return removeFrame(doc)
-    case 'newLayer': return addLayer(doc)
+    case 'newLayer': return addLayer(doc, action.id)
     case 'updateLayer': return {
       ...doc, layers: doc.layers.map(l => l.id === action.id ? { ...l, [action.key]: action.value } : l),
     }
@@ -132,7 +136,11 @@ function Brand({ compact = false }: { compact?: boolean }) {
 
 function Thumb({ project, index, active, onClick }: { project: Project; index: number; active: boolean; onClick: () => void }) {
   const ref = useRef<HTMLCanvasElement>(null)
-  useEffect(() => { if (ref.current) renderProject(ref.current, project, index) }, [project, index])
+  useEffect(() => {
+    // Rapid pen input must not trigger a complete thumbnail redraw for each point/stroke.
+    const timer = window.setTimeout(() => { if (ref.current) renderProject(ref.current, project, index) }, 180)
+    return () => clearTimeout(timer)
+  }, [project, index])
   return <button onClick={onClick} className={`frame-thumb ${active ? 'selected' : ''}`} title={`フレーム ${index + 1}`}>
     <div className="frame-thumb-image"><canvas ref={ref} width={WIDTH} height={HEIGHT} /></div>
     <span className="frame-number">{String(index + 1).padStart(2, '0')}</span>
@@ -152,17 +160,69 @@ function CanvasStage({ project, frameIndex, live, tool, interactive, onStart, on
   displayOptions?: boolean; className?: string
 }) {
   const canvas = useRef<HTMLCanvasElement>(null)
+  const preview = useRef<HTMLCanvasElement>(null)
   const pointers = useRef(new Map<number, { x: number; y: number }>())
   const gesture = useRef<{ distance: number; zoom: number; x: number; y: number; cx: number; cy: number } | null>(null)
   const dragging = useRef<{ id: number; x: number; y: number; panX: number; panY: number } | null>(null)
   const drawingId = useRef<number | null>(null)
   const lastPen = useRef(0)
+  const renderedRef = useRef<{ project: Project; frameIndex: number; grid: boolean; onion: boolean } | null>(null)
+  const destructivePreviewRef = useRef(false)
 
   useEffect(() => {
-    if (canvas.current) renderProject(canvas.current, project, frameIndex, {
-      onion: displayOptions && project.onion, grid: displayOptions && project.grid, extra: live || undefined,
-    })
-  }, [project, frameIndex, live, displayOptions])
+    const baseCanvas = canvas.current
+    if (!baseCanvas) return
+    const grid = displayOptions && project.grid
+    const onion = displayOptions && project.onion
+    const before = renderedRef.current
+    const earlier = before?.project
+    const prior = earlier?.frames[frameIndex]
+    const current = project.frames[frameIndex]
+    // A normal stroke on a single visible layer can be composited without replaying
+    // the whole drawing. This keeps long animations responsive after hundreds of strokes.
+    if (before && before.frameIndex === frameIndex && before.grid === grid && before.onion === onion &&
+      !grid && earlier && earlier.frames.length === project.frames.length &&
+      earlier.layers === project.layers && project.layers.length === 1 &&
+      earlier.background === project.background && prior && current &&
+      project.frames.every((frame, idx) => idx === frameIndex || earlier.frames[idx] === frame) &&
+      prior !== current) {
+      const id = project.layers[0].id
+      const oldStrokes = prior.tracks[id] || []
+      const newStrokes = current.tracks[id] || []
+      const addition = newStrokes[newStrokes.length - 1]
+      if (newStrokes.length === oldStrokes.length + 1 &&
+        oldStrokes.every((item, idx) => item === newStrokes[idx]) &&
+        addition && addition.tool !== 'eraser' && addition.tool !== 'fill') {
+        drawStroke(baseCanvas.getContext('2d')!, addition)
+        renderedRef.current = { project, frameIndex, grid, onion }
+        return
+      }
+    }
+    renderProject(baseCanvas, project, frameIndex, { onion, grid })
+    renderedRef.current = { project, frameIndex, grid, onion }
+  }, [project, frameIndex, displayOptions])
+
+  // Render the active stroke separately; existing frames never need to be replayed on every pen event.
+  useEffect(() => {
+    const overlay = preview.current
+    if (!overlay) return
+    const ctx = overlay.getContext('2d')!
+    ctx.clearRect(0, 0, WIDTH, HEIGHT)
+    if (live?.stroke.tool === 'eraser' || live?.stroke.tool === 'fill') {
+      if (canvas.current) renderProject(canvas.current, project, frameIndex, {
+        onion: displayOptions && project.onion, grid: displayOptions && project.grid, extra: live,
+      })
+      destructivePreviewRef.current = true
+    } else {
+      if (destructivePreviewRef.current && canvas.current) {
+        renderProject(canvas.current, project, frameIndex, {
+          onion: displayOptions && project.onion, grid: displayOptions && project.grid,
+        })
+      }
+      destructivePreviewRef.current = false
+      if (live) drawStroke(ctx, live.stroke)
+    }
+  }, [live, project, frameIndex, displayOptions])
 
   const coord = (e: ReactPointerEvent<HTMLCanvasElement>): Point => {
     const rect = e.currentTarget.getBoundingClientRect()
@@ -231,7 +291,8 @@ function CanvasStage({ project, frameIndex, live, tool, interactive, onStart, on
     setZoom(Math.max(.35, Math.min(4, zoom * (e.deltaY > 0 ? .9 : 1.1))))
   }}>
     <div className="stage-surface"><div className="artboard" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}>
-      <canvas ref={canvas} width={WIDTH} height={HEIGHT}
+      <canvas ref={canvas} width={WIDTH} height={HEIGHT} aria-hidden="true" />
+      <canvas ref={preview} width={WIDTH} height={HEIGHT}
         className={interactive && tool !== 'hand' ? 'draw-canvas' : 'move-canvas'}
         onPointerDown={pointerDown} onPointerMove={pointerMove}
         onPointerUp={e => pointerUp(e)} onPointerCancel={e => pointerUp(e, true)}
@@ -253,7 +314,6 @@ export default function App() {
   const projectRef = useRef(project)
   const peerRef = useRef<Peer | null>(null)
   const connRef = useRef<DataConnection | null>(null)
-  const statusRef = useRef(status)
   const roleRef = useRef<Role>(role)
   const [tool, setTool] = useState<Tool>('pen')
   const [color, setColor] = useState(PRESETS[0])
@@ -274,22 +334,94 @@ export default function App() {
   const [toast, setToast] = useState('')
   const historyRef = useRef<Project[]>([])
   const redoRef = useRef<Project[]>([])
+  const hostBaseRef = useRef(project)
+  const versionRef = useRef(0)
+  const acceptedRef = useRef<string[]>([])
+  const pendingActionsRef = useRef<{ id: string; action: Action; sent: boolean; sentAt: number }[]>([])
+  const resumeTokenRef = useRef('')
+  const everConnectedRef = useRef(false)
+  const phoneReadyRef = useRef(false)
+  const reconnectWantedRef = useRef(false)
+  const pendingRef = useRef<DataConnection | null>(null)
+  const retryTimerRef = useRef<number | null>(null)
+  const connectTimerRef = useRef<number | null>(null)
+  const attemptRef = useRef(0)
+  const retryStartRef = useRef<() => void>(() => {})
+  const scheduleRetryRef = useRef<() => void>(() => {})
+  const flushActionsRef = useRef<() => void>(() => {})
+  const lastReceivedRef = useRef(Date.now())
+  const lastSyncRequestRef = useRef(0)
+  const previewPointsRef = useRef<Point[]>([])
+  const previewStrokeRef = useRef('')
+  const previewTimerRef = useRef<number | null>(null)
+  const liveRafRef = useRef<number | null>(null)
 
-  useEffect(() => { projectRef.current = project }, [project])
-  useEffect(() => { statusRef.current = status }, [status])
+  // setDoc is the sole writer to projectRef. A React effect can run after newer
+  // remote actions were applied and overwrite the ref with an older render.
   useEffect(() => { roleRef.current = role }, [role])
   useEffect(() => { const id = setTimeout(() => { try { localStorage.setItem(STORAGE, JSON.stringify(project)) } catch { /* Storage may be full. */ } }, 800); return () => clearTimeout(id) }, [project])
   useEffect(() => { if (!toast) return; const id = setTimeout(() => setToast(''), 2600); return () => clearTimeout(id) }, [toast])
 
-  const send = useCallback((message: Wire) => {
-    if (connRef.current?.open) connRef.current.send(message)
+  const send = useCallback((message: Wire, previewOnly = false): boolean => {
+    const conn = connRef.current
+    if (!conn?.open || conn.dataChannel?.readyState !== 'open') return false
+    if (previewOnly && conn.dataChannel.bufferedAmount > 128_000) return false
+    try { conn.send(message); return true } catch { return false }
   }, [])
   const setDoc = useCallback((next: Project) => { projectRef.current = next; setProject(next) }, [])
-  const sync = useCallback((next: Project) => {
-    if (roleRef.current === 'pc') send({ type: 'sync', project: next })
+  const sync = useCallback((next: Project = projectRef.current) => {
+    if (roleRef.current === 'pc') send({
+      type: 'sync', project: next, version: versionRef.current,
+      accepted: acceptedRef.current, resumeToken: resumeTokenRef.current,
+    })
   }, [send])
+  const scheduleLive = useCallback(() => {
+    if (liveRafRef.current !== null) return
+    liveRafRef.current = requestAnimationFrame(() => {
+      liveRafRef.current = null
+      const drawing = liveRef.current
+      setLive(drawing ? { layer: drawing.layer, stroke: { ...drawing.stroke } } : null)
+    })
+  }, [])
+  const reconcilePhone = useCallback(() => {
+    let next = hostBaseRef.current
+    for (const entry of pendingActionsRef.current) {
+      // Undo/redo are resolved by an authoritative snapshot; other edits can be previewed offline.
+      if (entry.action.type !== 'undo' && entry.action.type !== 'redo')
+        next = applyBasicAction(next, entry.action)
+    }
+    setDoc(next)
+  }, [setDoc])
+  const flushActions = useCallback(() => {
+    const conn = connRef.current
+    if (roleRef.current !== 'phone' || !phoneReadyRef.current || !conn?.open) return
+    const now = Date.now()
+    let inFlight = 0
+    for (const entry of pendingActionsRef.current) {
+      if (entry.sent && now - entry.sentAt > 2500) entry.sent = false
+      if (entry.sent) inFlight++
+    }
+    for (const entry of pendingActionsRef.current) {
+      if (inFlight >= 6) break
+      if (entry.sent) continue
+      if (!conn.dataChannel || conn.dataChannel.readyState !== 'open' || conn.dataChannel.bufferedAmount > 64_000) break
+      if (!send({ type: 'action', id: entry.id, action: entry.action })) break
+      entry.sent = true
+      entry.sentAt = now
+      inFlight++
+    }
+  }, [send])
+  flushActionsRef.current = flushActions
+  useEffect(() => {
+    const id = window.setInterval(() => flushActionsRef.current(), 60)
+    return () => clearInterval(id)
+  }, [])
 
-  const execute = useCallback((action: Action, fromRemote = false) => {
+  const execute = useCallback((input: Action, fromRemote = false) => {
+    const action: Action = !fromRemote && input.type === 'newFrame' && !input.id
+      ? { ...input, id: crypto.randomUUID() }
+      : !fromRemote && input.type === 'newLayer' && !input.id
+        ? { ...input, id: crypto.randomUUID() } : input
     const previous = projectRef.current
     let next = previous
     if (action.type === 'undo') {
@@ -309,26 +441,86 @@ export default function App() {
       }
     }
     if (next !== previous) setDoc(next)
-    if (roleRef.current === 'phone' && !fromRemote) send({ type: 'action', action })
-    if (roleRef.current === 'pc') sync(next)
+    if (roleRef.current === 'phone' && !fromRemote && next !== previous) {
+      pendingActionsRef.current.push({ id: crypto.randomUUID(), action, sent: false, sentAt: 0 })
+      flushActionsRef.current()
+    }
+    if (roleRef.current === 'pc' && next !== previous) {
+      versionRef.current++
+      if (!fromRemote) {
+        if (action.type === 'set' || action.type === 'updateLayer' || action.type === 'stroke')
+          send({ type: 'commit', version: versionRef.current, action })
+        else sync(next)
+      }
+    }
   }, [send, setDoc, sync])
 
   const executeRef = useRef(execute)
   executeRef.current = execute
-  const setDocRef = useRef(setDoc)
-  setDocRef.current = setDoc
 
   const handleWire = useCallback((payload: unknown) => {
     if (!payload || typeof payload !== 'object' || !('type' in payload)) return
     const msg = payload as Wire
-    if (msg.type === 'sync' && roleRef.current === 'phone' && isProject(msg.project)) {
-      setDocRef.current(msg.project)
-      setStatus('connected')
+    lastReceivedRef.current = Date.now()
+    if (msg.type === 'ping') { send({ type: 'pong' }, true); return }
+    if (msg.type === 'pong') return
+    if (roleRef.current === 'phone') {
+      if (msg.type === 'sync' && isProject(msg.project)) {
+        hostBaseRef.current = msg.project
+        versionRef.current = msg.version
+        resumeTokenRef.current = msg.resumeToken
+        const accepted = new Set(msg.accepted || [])
+        pendingActionsRef.current = pendingActionsRef.current
+          .filter(entry => !accepted.has(entry.id))
+          .map(entry => ({ ...entry, sent: false, sentAt: 0 }))
+        reconcilePhone()
+        everConnectedRef.current = true
+        phoneReadyRef.current = true
+        attemptRef.current = 0
+        setStatus('connected')
+        setError('')
+        flushActionsRef.current()
+      } else if (msg.type === 'commit') {
+        if (msg.version === versionRef.current + 1) {
+          hostBaseRef.current = applyBasicAction(hostBaseRef.current, msg.action)
+          versionRef.current = msg.version
+          reconcilePhone()
+        } else if (msg.version > versionRef.current && Date.now() - lastSyncRequestRef.current > 1500) {
+          lastSyncRequestRef.current = Date.now()
+          send({ type: 'requestSync' })
+        }
+      } else if (msg.type === 'ack') {
+        const entry = pendingActionsRef.current.find(item => item.id === msg.id)
+        if (!entry) return
+        pendingActionsRef.current = pendingActionsRef.current.filter(item => item.id !== msg.id)
+        if (msg.version === versionRef.current + 1 &&
+          (entry.action.type === 'set' || entry.action.type === 'updateLayer' || entry.action.type === 'stroke')) {
+          hostBaseRef.current = applyBasicAction(hostBaseRef.current, entry.action)
+          versionRef.current = msg.version
+        } else if (msg.version !== versionRef.current) {
+          if (Date.now() - lastSyncRequestRef.current > 1500) {
+            lastSyncRequestRef.current = Date.now()
+            send({ type: 'requestSync' })
+          }
+        }
+        reconcilePhone()
+        flushActionsRef.current()
+      }
+      return
     }
     if (roleRef.current !== 'pc') return
-    if (msg.type === 'action' && msg.action && typeof msg.action.type === 'string') {
+    if (msg.type === 'requestSync') { sync(); return }
+    if (msg.type === 'action' && msg.id && msg.action && typeof msg.action.type === 'string') {
+      if (acceptedRef.current.includes(msg.id)) {
+        send({ type: 'ack', id: msg.id, version: versionRef.current })
+        return
+      }
       if (msg.action.type === 'stroke') { liveRef.current = null; setLive(null) }
       executeRef.current(msg.action, true)
+      acceptedRef.current.push(msg.id)
+      if (acceptedRef.current.length > 1200) acceptedRef.current.shift()
+      send({ type: 'ack', id: msg.id, version: versionRef.current })
+      if (msg.action.type !== 'set' && msg.action.type !== 'updateLayer' && msg.action.type !== 'stroke') sync()
     }
     if (msg.type === 'start' && msg.stroke && msg.stroke.points?.length && msg.frame >= 0 && msg.frame < projectRef.current.frames.length &&
         projectRef.current.layers.some(l => l.id === msg.layer && !l.locked)) {
@@ -336,120 +528,295 @@ export default function App() {
       setLive(liveRef.current)
       drawFrameRef.current = msg.frame
     }
-    if (msg.type === 'point' && liveRef.current && msg.point && Number.isFinite(msg.point.x) && Number.isFinite(msg.point.y)) {
-      const previous = liveRef.current
-      liveRef.current = { ...previous, stroke: { ...previous.stroke, points: [...previous.stroke.points, msg.point] } }
-      setLive(liveRef.current)
+    if (msg.type === 'points' && liveRef.current && liveRef.current.stroke.id === msg.strokeId &&
+        Array.isArray(msg.points) && msg.points.length <= 64) {
+      if (['line', 'rect', 'ellipse'].includes(liveRef.current.stroke.tool)) {
+        liveRef.current.stroke.points = [liveRef.current.stroke.points[0], msg.points[msg.points.length - 1]]
+      } else {
+        for (const point of msg.points)
+          if (Number.isFinite(point.x) && Number.isFinite(point.y)) liveRef.current.stroke.points.push(point)
+      }
+      scheduleLive()
     }
     if (msg.type === 'cancel') { liveRef.current = null; setLive(null) }
-  }, [])
+  }, [reconcilePhone, scheduleLive, send, sync])
 
   const handleWireRef = useRef(handleWire)
   handleWireRef.current = handleWire
 
   const closePeer = useCallback(() => {
-    connRef.current?.close()
+    reconnectWantedRef.current = false
+    phoneReadyRef.current = false
+    if (retryTimerRef.current !== null) clearTimeout(retryTimerRef.current)
+    if (connectTimerRef.current !== null) clearTimeout(connectTimerRef.current)
+    if (previewTimerRef.current !== null) clearTimeout(previewTimerRef.current)
+    if (liveRafRef.current !== null) cancelAnimationFrame(liveRafRef.current)
+    retryTimerRef.current = null
+    connectTimerRef.current = null
+    previewTimerRef.current = null
+    liveRafRef.current = null
+    const oldConn = connRef.current
     connRef.current = null
-    peerRef.current?.destroy()
+    oldConn?.close()
+    const oldPeer = peerRef.current
     peerRef.current = null
+    oldPeer?.destroy()
+    pendingRef.current = null
     setPending(null)
   }, [])
   useEffect(() => () => closePeer(), [closePeer])
 
   const onConnected = useCallback((conn: DataConnection, isHost: boolean) => {
     connRef.current = conn
+    lastReceivedRef.current = Date.now()
+    if (connectTimerRef.current !== null) clearTimeout(connectTimerRef.current)
+    connectTimerRef.current = null
     conn.on('data', value => handleWireRef.current(value))
-    conn.on('close', () => {
+    const disconnected = () => {
       if (connRef.current !== conn) return
       connRef.current = null
+      phoneReadyRef.current = false
+      previewPointsRef.current = []
       liveRef.current = null
       setLive(null)
-      setStatus(isHost ? 'ready' : 'error')
-      setError(isHost ? '' : 'PCとの接続が切れました。コードを入力し直してください。')
-    })
+      if (isHost) {
+        setStatus('ready')
+      } else if (reconnectWantedRef.current) {
+        for (const entry of pendingActionsRef.current) { entry.sent = false; entry.sentAt = 0 }
+        setStatus('reconnecting')
+        setError('接続を復旧しています。描画は端末内に保持されます。')
+        scheduleRetryRef.current()
+      }
+    }
+    conn.on('close', disconnected)
     conn.on('error', () => {
-      if (connRef.current === conn) { setStatus(isHost ? 'ready' : 'error'); setError('接続でエラーが発生しました。') }
+      disconnected()
+      if (conn.open) conn.close()
     })
     if (isHost) {
       setStatus('connected')
-      conn.send({ type: 'sync', project: projectRef.current } satisfies Wire)
-    } else setStatus('waiting')
+      sync()
+    } else setStatus(everConnectedRef.current ? 'reconnecting' : 'waiting')
+  }, [sync])
+
+  const startPhoneAttempt = useCallback(() => {
+    if (!reconnectWantedRef.current || !/^\d{5}$/.test(entryCode)) return
+    if (retryTimerRef.current !== null) clearTimeout(retryTimerRef.current)
+    if (connectTimerRef.current !== null) clearTimeout(connectTimerRef.current)
+    const oldConn = connRef.current
+    connRef.current = null
+    oldConn?.close()
+    const oldPeer = peerRef.current
+    peerRef.current = null
+    oldPeer?.destroy()
+    const peer = new Peer()
+    peerRef.current = peer
+    setStatus(everConnectedRef.current ? 'reconnecting' : 'connecting')
+    const fail = (message: string) => {
+      if (peerRef.current !== peer || !reconnectWantedRef.current) return
+      if (connectTimerRef.current !== null) clearTimeout(connectTimerRef.current)
+      connectTimerRef.current = null
+      if (everConnectedRef.current) {
+        setStatus('reconnecting')
+        setError(message)
+        scheduleRetryRef.current()
+      } else {
+        setStatus('error')
+        setError(message)
+        reconnectWantedRef.current = false
+      }
+    }
+    connectTimerRef.current = window.setTimeout(() => fail('接続がタイムアウトしました。'), 16_000)
+    peer.on('open', () => {
+      if (peerRef.current !== peer) return
+      const conn = peer.connect(`frame-studio-${entryCode}`, {
+        reliable: true, serialization: 'binary',
+        metadata: { resumeToken: resumeTokenRef.current || undefined },
+      })
+      conn.on('open', () => {
+        if (peerRef.current === peer) onConnected(conn, false)
+        else conn.close()
+      })
+      conn.on('error', () => fail('接続が中断しました。再試行します。'))
+      conn.on('close', () => {
+        if (connRef.current !== conn) fail('接続が切れました。')
+      })
+    })
+    peer.on('disconnected', () => {
+      if (peerRef.current !== peer || peer.destroyed) return
+      try { peer.reconnect() } catch { fail('接続サービスに再接続しています。') }
+    })
+    peer.on('error', err => fail(err.type === 'peer-unavailable'
+      ? 'このコードのPCが見つかりません。'
+      : `接続サービスのエラー（${err.type}）`))
+  }, [entryCode, onConnected])
+  retryStartRef.current = startPhoneAttempt
+  const scheduleRetry = useCallback(() => {
+    if (!reconnectWantedRef.current || retryTimerRef.current !== null) return
+    const delay = Math.min(12_000, 1200 * Math.pow(1.7, Math.min(attemptRef.current++, 5)))
+    retryTimerRef.current = window.setTimeout(() => {
+      retryTimerRef.current = null
+      retryStartRef.current()
+    }, delay)
   }, [])
+  scheduleRetryRef.current = scheduleRetry
+
+  useEffect(() => {
+    const check = window.setInterval(() => {
+      const conn = connRef.current
+      if (!conn?.open) return
+      if (Date.now() - lastReceivedRef.current > 30_000) {
+        conn.close()
+      } else send({ type: 'ping' }, true)
+    }, 5000)
+    const wake = () => {
+      if (roleRef.current === 'phone' && reconnectWantedRef.current && !connRef.current?.open)
+        scheduleRetryRef.current()
+    }
+    window.addEventListener('online', wake)
+    document.addEventListener('visibilitychange', wake)
+    return () => {
+      clearInterval(check)
+      window.removeEventListener('online', wake)
+      document.removeEventListener('visibilitychange', wake)
+    }
+  }, [send])
 
   const createHost = useCallback(() => {
     closePeer()
+    everConnectedRef.current = false
+    resumeTokenRef.current = ''
+    versionRef.current = 0
+    acceptedRef.current = []
     setRole('pc'); roleRef.current = 'pc'; setError(''); setCode(''); setStatus('creating')
     const hostCode = secureCode()
     const peer = new Peer(`frame-studio-${hostCode}`)
     peerRef.current = peer
     peer.on('open', () => { setCode(hostCode); setStatus('ready') })
     peer.on('connection', incoming => {
-      if (connRef.current?.open || pending) { incoming.on('open', () => incoming.close()); return }
-      incoming.on('open', () => { setPending(incoming) })
-      incoming.on('error', () => setPending(current => current === incoming ? null : current))
-      incoming.on('close', () => setPending(current => current === incoming ? null : current))
+      if (connRef.current?.open || pendingRef.current?.open) {
+        incoming.on('open', () => incoming.close())
+        return
+      }
+      incoming.on('open', () => {
+        if (peerRef.current !== peer) { incoming.close(); return }
+        if (resumeTokenRef.current && incoming.metadata?.resumeToken === resumeTokenRef.current) {
+          onConnected(incoming, true)
+        } else {
+          pendingRef.current = incoming
+          setPending(incoming)
+        }
+      })
+      const clearPending = () => {
+        if (pendingRef.current === incoming) pendingRef.current = null
+        setPending(current => current === incoming ? null : current)
+      }
+      incoming.on('error', clearPending)
+      incoming.on('close', clearPending)
     })
     peer.on('error', err => {
       setError(err.type === 'unavailable-id' ? 'コードが重複しました。再発行してください。' : `接続サービスにアクセスできません（${err.type}）。`)
       setStatus('error')
     })
     peer.on('disconnected', () => {
-      if (!peer.destroyed) peer.reconnect()
+      if (!peer.destroyed) { try { peer.reconnect() } catch { setError('接続サービスへの再接続に失敗しました。') } }
     })
-  }, [closePeer, pending])
+  }, [closePeer, onConnected])
 
   const createPhone = useCallback(() => {
     closePeer(); setRole('phone'); roleRef.current = 'phone'; setStatus('idle'); setError('')
+    pendingActionsRef.current = []
+    resumeTokenRef.current = ''
+    everConnectedRef.current = false
   }, [closePeer])
 
   const connectPhone = useCallback(() => {
     if (!/^\d{5}$/.test(entryCode)) { setError('5桁の数字を入力してください。'); return }
-    closePeer(); setError(''); setStatus('connecting')
-    const peer = new Peer()
-    peerRef.current = peer
-    peer.on('open', () => {
-      const conn = peer.connect(`frame-studio-${entryCode}`, { reliable: true, serialization: 'json' })
-      conn.on('open', () => onConnected(conn, false))
-      conn.on('error', () => { setError('接続できませんでした。コードを確認してください。'); setStatus('error') })
-    })
-    peer.on('error', err => { setError(err.type === 'peer-unavailable' ? 'このコードのPCが見つかりません。' : `接続エラー（${err.type}）。`); setStatus('error') })
-  }, [entryCode, closePeer, onConnected])
+    reconnectWantedRef.current = true
+    resumeTokenRef.current = ''
+    attemptRef.current = 0
+    setError('')
+    startPhoneAttempt()
+  }, [entryCode, startPhoneAttempt])
 
   const acceptPending = () => {
-    if (pending?.open) onConnected(pending, true)
+    if (pending?.open) {
+      resumeTokenRef.current = crypto.randomUUID()
+      onConnected(pending, true)
+    }
+    pendingRef.current = null
     setPending(null)
   }
 
+  const flushPreview = () => {
+    if (!previewStrokeRef.current) return
+    while (previewPointsRef.current.length) {
+      const points = previewPointsRef.current.splice(0, 48)
+      // Preview traffic is expendable. A completed stroke is always sent reliably.
+      if (!send({ type: 'points', strokeId: previewStrokeRef.current, points }, true)) {
+        previewPointsRef.current = []
+        break
+      }
+    }
+  }
   const drawStart = (p: Point) => {
     if (playing) setPlaying(false)
-    if (roleRef.current === 'phone' && statusRef.current !== 'connected') return
+    if (roleRef.current === 'phone' && !everConnectedRef.current) return
     const layer = projectRef.current.layers.find(l => l.id === projectRef.current.activeLayer)
     if (!layer || layer.locked || !layer.visible) { setToast('レイヤーのロックまたは非表示を解除してください'); return }
     const stroke: Stroke = { id: crypto.randomUUID(), tool: tool as Stroke['tool'], color, size, opacity: opacity / 100, pressure, points: [p] }
     drawFrameRef.current = projectRef.current.activeFrame
     liveRef.current = { layer: layer.id, stroke }
     setLive(liveRef.current)
-    if (roleRef.current === 'phone') send({ type: 'start', frame: drawFrameRef.current, layer: layer.id, stroke })
+    previewStrokeRef.current = stroke.id
+    previewPointsRef.current = []
+    if (roleRef.current === 'phone') send({ type: 'start', frame: drawFrameRef.current, layer: layer.id, stroke }, true)
   }
 
   const drawPoint = (p: Point) => {
     if (!liveRef.current) return
     const previous = liveRef.current
     const toolId = previous.stroke.tool
-    const points = toolId === 'line' || toolId === 'rect' || toolId === 'ellipse'
-      ? [previous.stroke.points[0], p] : [...previous.stroke.points, p]
-    liveRef.current = { ...previous, stroke: { ...previous.stroke, points } }
-    setLive(liveRef.current)
-    if (roleRef.current === 'phone') send({ type: 'point', point: p })
+    const rounded: Point = { x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10, p: Math.round(p.p * 100) / 100 }
+    const points = previous.stroke.points
+    const last = points[points.length - 1]
+    if (Math.abs(last.x - rounded.x) + Math.abs(last.y - rounded.y) < .35) return
+    if (toolId === 'line' || toolId === 'rect' || toolId === 'ellipse')
+      previous.stroke.points = [points[0], rounded]
+    else points.push(rounded)
+    scheduleLive()
+    if (roleRef.current === 'phone') {
+      if (toolId === 'line' || toolId === 'rect' || toolId === 'ellipse') previewPointsRef.current = [rounded]
+      else previewPointsRef.current.push(rounded)
+      if (previewTimerRef.current === null) {
+        previewTimerRef.current = window.setTimeout(() => {
+          previewTimerRef.current = null
+          flushPreview()
+        }, 32)
+      }
+    }
   }
 
   const drawFinish = () => {
     const current = liveRef.current
     if (!current) return
+    if (previewTimerRef.current !== null) clearTimeout(previewTimerRef.current)
+    previewTimerRef.current = null
+    flushPreview()
+    previewStrokeRef.current = ''
+    previewPointsRef.current = []
     liveRef.current = null; setLive(null)
     execute({ type: 'stroke', frame: drawFrameRef.current, layer: current.layer, stroke: current.stroke })
   }
-  const drawCancel = () => { liveRef.current = null; setLive(null); if (roleRef.current === 'phone') send({ type: 'cancel' }) }
+  const drawCancel = () => {
+    if (previewTimerRef.current !== null) clearTimeout(previewTimerRef.current)
+    previewTimerRef.current = null
+    previewStrokeRef.current = ''
+    previewPointsRef.current = []
+    liveRef.current = null
+    setLive(null)
+    if (roleRef.current === 'phone') send({ type: 'cancel' }, true)
+  }
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -562,7 +929,7 @@ export default function App() {
     </main><footer className="landing-footer"><span>CREATIVITY LOOKS BETTER IN MOTION.</span><span>DESIGNED FOR EVERY FIRST FRAME ↗</span></footer>
   </div>
 
-  if (role === 'phone' && !connected) return <div className="connect-page">
+  if (role === 'phone' && !everConnectedRef.current) return <div className="connect-page">
     <div className="connect-head"><button onClick={() => { closePeer(); setRole(null) }}><ArrowLeft size={19} /></button><Brand compact /></div>
     <div className="connect-content"><div className="connect-art"><Smartphone size={44} /><div className="connect-wave" /></div>
       <div className="eyebrow">CONNECT YOUR DEVICE</div><h2>PCとつないで、<br />描きはじめよう。</h2>
@@ -585,7 +952,7 @@ export default function App() {
         <input className="project-title" aria-label="作品名" value={project.name} onChange={e => choose({ type: 'set', key: 'name', value: e.target.value })} />
         <span className="save-indicator"><Check size={13} /> 自動保存</span></div>
       <div className="header-actions">
-        <span className={`connection-pill ${connected ? 'is-connected' : ''}`}><span className="pulse-dot" /> {connected ? 'LIVE接続中' : isPhone ? '切断' : '待機中'}</span>
+        <span className={`connection-pill ${connected ? 'is-connected' : isPhone ? 'is-reconnecting' : ''}`}><span className="pulse-dot" /> {connected ? 'LIVE接続中' : isPhone ? '再接続中' : '待機中'}</span>
         {!isPhone && <Button className="outline tiny" onClick={() => { navigator.clipboard?.writeText(code).then(() => setToast('コードをコピーしました')).catch(() => setToast(`接続コード: ${code}`)) }}><Link2 size={15} /> <span className="hide-small">接続コード</span> {code || '·····'}</Button>}
         <IconButton icon={CircleHelp} title="使い方" onClick={() => setShowHelp(true)} />
         <Button className="primary tiny export-main" onClick={() => setShowExport(true)}><Download size={16} /> <span>書き出し</span></Button>
@@ -650,7 +1017,8 @@ export default function App() {
     </div>}
 
     {isPhone && <div className="phone-layout">
-      <div className="mobile-context"><div className="mobile-work-label"><span className="pulse-dot" /> PCと同期中</div><div className="mobile-frame-indicator">FRAME <b>{String(project.activeFrame + 1).padStart(2, '0')}</b><span> / {String(project.frames.length).padStart(2, '0')}</span></div></div>
+      <div className="mobile-context"><div className="mobile-work-label"><span className="pulse-dot" /> {connected ? 'PCと同期中' : 'オフライン編集・再接続中'}</div><div className="mobile-frame-indicator">FRAME <b>{String(project.activeFrame + 1).padStart(2, '0')}</b><span> / {String(project.frames.length).padStart(2, '0')}</span></div></div>
+      {!connected && <div className="recovery-notice" role="status"><WifiOff size={17} /><span>接続を復旧しています。描画は保存され、復旧後に転送されます。</span><button onClick={startPhoneAttempt}>再接続</button></div>}
       <div className="mobile-stage-wrap"><CanvasStage className="mobile-stage" project={project} frameIndex={activeFrame} live={live} tool={tool} interactive
         onStart={drawStart} onPoint={drawPoint} onFinish={drawFinish} onCancel={drawCancel} onPick={setColor}
         zoom={zoom} setZoom={setZoom} pan={pan} setPan={setPan} />

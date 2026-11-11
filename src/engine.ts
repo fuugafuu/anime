@@ -39,12 +39,12 @@ export function createProject(): Project {
   }
 }
 
-export function addFrame(doc: Project, duplicate = false): Project {
+export function addFrame(doc: Project, duplicate = false, frameId: string = uid()): Project {
   if (doc.frames.length >= 120) return doc
   const source = doc.frames[doc.activeFrame]
   const tracks = duplicate ? structuredClone(source.tracks) : {}
   const next = [...doc.frames]
-  next.splice(doc.activeFrame + 1, 0, { id: uid(), tracks })
+  next.splice(doc.activeFrame + 1, 0, { id: frameId, tracks })
   return { ...doc, frames: next, activeFrame: doc.activeFrame + 1 }
 }
 
@@ -54,9 +54,9 @@ export function removeFrame(doc: Project): Project {
   return { ...doc, frames, activeFrame: Math.min(doc.activeFrame, frames.length - 1) }
 }
 
-export function addLayer(doc: Project): Project {
+export function addLayer(doc: Project, layerId: string = uid()): Project {
   if (doc.layers.length >= 12) return doc
-  const layer = { id: uid(), name: `レイヤー ${doc.layers.length + 1}`, visible: true, locked: false }
+  const layer = { id: layerId, name: `レイヤー ${doc.layers.length + 1}`, visible: true, locked: false }
   return { ...doc, layers: [...doc.layers, layer], activeLayer: layer.id }
 }
 
@@ -64,6 +64,7 @@ export function appendStroke(doc: Project, index: number, layerId: string, strok
   if (index < 0 || index >= doc.frames.length || !doc.layers.some(l => l.id === layerId && !l.locked)) return doc
   const frames = [...doc.frames]
   const frame = frames[index]
+  if ((frame.tracks[layerId] || []).some(item => item.id === stroke.id)) return doc
   frames[index] = { ...frame, tracks: { ...frame.tracks, [layerId]: [...(frame.tracks[layerId] || []), stroke] } }
   return { ...doc, frames }
 }
