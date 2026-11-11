@@ -13,9 +13,16 @@ import {
 } from 'lucide-react'
 import {
   addFrame, addLayer, appendStroke, createProject, drawStroke, HEIGHT, removeFrame, renderProject,
-  sampleColor, undoStroke, WIDTH,
+  sampleColor, undoStroke, waitForRasterFrames, WIDTH,
   type Point, type Project, type Stroke, type Tool,
 } from './engine'
+import AiDialog from './AiDialog'
+import {
+  applyAssist, applyAssistAction, getAiHealth, loadAiModel, processAi,
+  type AiHealth, type AssistAction, type AssistCandidate, type AssistRequest, type AssistResult, type ModelSource,
+} from './ai-client'
+
+type AssistForm = Pick<AssistRequest, 'mode' | 'count' | 'spacing' | 'arc' | 'strength'>
 
 type Role = 'pc' | 'phone' | null
 type Status = 'idle' | 'creating' | 'ready' | 'connecting' | 'waiting' | 'connected' | 'reconnecting' | 'error'
@@ -29,6 +36,7 @@ type Action =
   | { type: 'redo' }
   | { type: 'stroke'; frame: number; layer: string; stroke: Stroke }
   | { type: 'replace'; project: Project }
+  | ({ type: 'aiApply' } & AssistAction)
 
 type Wire =
   | { type: 'sync'; project: Project; version: number; accepted: string[]; resumeToken: string }
@@ -40,6 +48,11 @@ type Wire =
   | { type: 'points'; strokeId: string; points: Point[] }
   | { type: 'cancel' }
   | { type: 'ping' | 'pong' }
+  | { type: 'aiRequest'; request: AssistRequest }
+  | { type: 'aiResult'; result: AssistResult }
+  | { type: 'aiHealth'; health: AiHealth | null }
+  | { type: 'aiAccept'; id: string }
+  | { type: 'aiDiscard'; id: string }
 
 const STORAGE = 'frame-studio-autosave-v1'
 const PRESETS = ['#20243c', '#ffffff', '#ef5d6d', '#ffb55a', '#e9ce64', '#6bd5b3', '#5aa5ef', '#9b83f2']
@@ -110,6 +123,7 @@ function applyBasicAction(doc: Project, action: Action): Project {
     }
     case 'stroke': return appendStroke(doc, action.frame, action.layer, action.stroke)
     case 'replace': return isProject(action.project) ? action.project : doc
+    case 'aiApply': return applyAssistAction(doc, action)
     case 'undo': return undoStroke(doc)
     default: return doc
   }
@@ -332,6 +346,19 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(true)
   const [exporting, setExporting] = useState(false)
   const [toast, setToast] = useState('')
+  const [showAi, setShowAi] = useState(false)
+  const [aiBusy, setAiBusy] = useState(false)
+  const [aiResult, setAiResult] = useState<AssistResult | null>(null)
+  const [aiHealth, setAiHealth] = useState<AiHealth | null>(null)
+  const aiHealthRef = useRef<AiHealth | null>(null)
+  const aiCandidateRef = useRef<AssistCandidate | null>(null)
+  const aiBusyRef = useRef(false)
+  const aiTimeoutRef = useRef<number | null>(null)
+  // Ignore late responses from an earlier request, particularly after reconnecting.
+  const aiActiveRequestRef = useRef<string | null>(null)
+  const runAiRef = useRef<(request: AssistRequest, phone: boolean) => void>(() => {})
+  const acceptAiRef = useRef<(id: string, phone?: boolean) => void>(() => {})
+  const discardAiRef = useRef<(id: string, phone?: boolean) => void>(() => {})
   const historyRef = useRef<Project[]>([])
   const redoRef = useRef<Project[]>([])
   const hostBaseRef = useRef(project)
@@ -433,7 +460,7 @@ export default function App() {
     } else {
       next = applyBasicAction(previous, action)
       if (next !== previous) {
-        if (['stroke', 'deleteFrame', 'newFrame', 'newLayer', 'replace'].includes(action.type)) {
+        if (['stroke', 'deleteFrame', 'newFrame', 'newLayer', 'replace', 'aiApply'].includes(action.type)) {
           historyRef.current.push(previous)
           if (historyRef.current.length > 35) historyRef.current.shift()
           redoRef.current = []
@@ -448,7 +475,7 @@ export default function App() {
     if (roleRef.current === 'pc' && next !== previous) {
       versionRef.current++
       if (!fromRemote) {
-        if (action.type === 'set' || action.type === 'updateLayer' || action.type === 'stroke')
+        if (action.type === 'set' || action.type === 'updateLayer' || action.type === 'stroke' || action.type === 'aiApply')
           send({ type: 'commit', version: versionRef.current, action })
         else sync(next)
       }
@@ -458,6 +485,98 @@ export default function App() {
   const executeRef = useRef(execute)
   executeRef.current = execute
 
+  // Inference always runs on the host PC. The phone only sends a small request
+  // and receives a compressed preview; candidates remain on the PC until accepted.
+  const runAi = useCallback(async (request: AssistRequest, fromPhone: boolean) => {
+    if (roleRef.current !== 'pc') return
+    if (aiBusyRef.current) {
+      const result = { id: request.id, message: '', error: '別の処理が進行中です。完了後に再実行してください。' }
+      if (fromPhone) send({ type: 'aiResult', result })
+      else setAiResult(result)
+      return
+    }
+    aiCandidateRef.current = null
+    setAiResult(null)
+    aiBusyRef.current = true
+    setAiBusy(true)
+    try {
+      const { candidate, result } = await processAi(projectRef.current, request)
+      if (candidate && !applyAssist(projectRef.current, candidate))
+        throw Error('生成中に対象の原画が変更されました。もう一度生成してください。')
+      aiCandidateRef.current = candidate || null
+      setAiResult(result)
+      if (fromPhone) send({ type: 'aiResult', result })
+    } catch (err) {
+      const result = { id: request.id, message: '', error: err instanceof Error ? err.message : 'AI処理に失敗しました。' }
+      setAiResult(result)
+      if (fromPhone) send({ type: 'aiResult', result })
+    } finally {
+      aiBusyRef.current = false
+      setAiBusy(false)
+    }
+  }, [send])
+  runAiRef.current = runAi
+
+  const acceptAi = useCallback((id: string, fromPhone = false) => {
+    if (roleRef.current !== 'pc') return
+    const candidate = aiCandidateRef.current
+    if (!candidate || candidate.id !== id) {
+      if (fromPhone) send({ type: 'aiResult', result: { id, message: '', error: '候補が見つかりません。再生成してください。' } })
+      return
+    }
+    const applied = applyAssist(projectRef.current, candidate)
+    if (!applied) {
+      const result = { id, message: '', error: '原画が変更されているため採用できません。再生成してください。' }
+      setAiResult(result)
+      if (fromPhone) send({ type: 'aiResult', result })
+      aiCandidateRef.current = null
+      return
+    }
+    executeRef.current({ type: 'aiApply', kind: candidate.kind, frameId: candidate.frameId,
+      nextFrameId: candidate.nextFrameId, layerId: candidate.layerId, frames: candidate.frames })
+    aiCandidateRef.current = null
+    setAiResult(null)
+    setToast(`${candidate.frames.length}枚のAI候補を反映しました`)
+    if (fromPhone) send({ type: 'aiResult', result: { id, message: '候補を作品に反映しました。' } })
+  }, [send])
+  acceptAiRef.current = acceptAi
+
+  const discardAi = useCallback((id: string, fromPhone = false) => {
+    if (roleRef.current !== 'pc') return
+    if (aiCandidateRef.current?.id === id) {
+      aiCandidateRef.current = null
+      setAiResult(null)
+    }
+    if (fromPhone) send({ type: 'aiResult', result: { id, message: '候補を破棄しました。' } })
+  }, [send])
+  discardAiRef.current = discardAi
+
+  useEffect(() => {
+    if (role !== 'pc') return
+    let active = true
+    const poll = async () => {
+      let health: AiHealth | null = null
+      try { health = await getAiHealth() } catch { /* Service is optional. */ }
+      if (!active) return
+      aiHealthRef.current = health
+      setAiHealth(health)
+      send({ type: 'aiHealth', health }, true)
+    }
+    void poll()
+    const timer = window.setInterval(() => void poll(), 12_000)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [role, send])
+
+  const handleModelLoad = useCallback(async (source: ModelSource, directory = '') => {
+    if (roleRef.current !== 'pc') throw Error('モデルの読み込みはPCで操作してください。')
+    const message = await loadAiModel(source, directory)
+    const health = await getAiHealth()
+    aiHealthRef.current = health
+    setAiHealth(health)
+    send({ type: 'aiHealth', health }, true)
+    return message
+  }, [send])
+
   const handleWire = useCallback((payload: unknown) => {
     if (!payload || typeof payload !== 'object' || !('type' in payload)) return
     const msg = payload as Wire
@@ -465,6 +584,16 @@ export default function App() {
     if (msg.type === 'ping') { send({ type: 'pong' }, true); return }
     if (msg.type === 'pong') return
     if (roleRef.current === 'phone') {
+      if (msg.type === 'aiHealth') { aiHealthRef.current = msg.health; setAiHealth(msg.health); return }
+      if (msg.type === 'aiResult') {
+        if (msg.result.id !== aiActiveRequestRef.current) return
+        if (aiTimeoutRef.current !== null) clearTimeout(aiTimeoutRef.current)
+        aiTimeoutRef.current = null
+        if (!msg.result.preview) aiActiveRequestRef.current = null
+        setAiBusy(false)
+        setAiResult(msg.result)
+        return
+      }
       if (msg.type === 'sync' && isProject(msg.project)) {
         hostBaseRef.current = msg.project
         versionRef.current = msg.version
@@ -509,6 +638,14 @@ export default function App() {
       return
     }
     if (roleRef.current !== 'pc') return
+    if (msg.type === 'aiRequest') {
+      if (msg.request && typeof msg.request.id === 'string' &&
+          ['neural', 'inbetween', 'cleanup', 'review'].includes(msg.request.mode))
+        void runAiRef.current(msg.request, true)
+      return
+    }
+    if (msg.type === 'aiAccept') { acceptAiRef.current(msg.id, true); return }
+    if (msg.type === 'aiDiscard') { discardAiRef.current(msg.id, true); return }
     if (msg.type === 'requestSync') { sync(); return }
     if (msg.type === 'action' && msg.id && msg.action && typeof msg.action.type === 'string') {
       if (acceptedRef.current.includes(msg.id)) {
@@ -550,6 +687,9 @@ export default function App() {
     if (retryTimerRef.current !== null) clearTimeout(retryTimerRef.current)
     if (connectTimerRef.current !== null) clearTimeout(connectTimerRef.current)
     if (previewTimerRef.current !== null) clearTimeout(previewTimerRef.current)
+    if (aiTimeoutRef.current !== null) clearTimeout(aiTimeoutRef.current)
+    aiTimeoutRef.current = null
+    aiActiveRequestRef.current = null
     if (liveRafRef.current !== null) cancelAnimationFrame(liveRafRef.current)
     retryTimerRef.current = null
     connectTimerRef.current = null
@@ -579,6 +719,12 @@ export default function App() {
       previewPointsRef.current = []
       liveRef.current = null
       setLive(null)
+      if (!isHost) {
+        if (aiTimeoutRef.current !== null) clearTimeout(aiTimeoutRef.current)
+        aiTimeoutRef.current = null
+        setAiBusy(false)
+        setAiResult(previous => previous?.preview ? previous : null)
+      }
       if (isHost) {
         setStatus('ready')
       } else if (reconnectWantedRef.current) {
@@ -596,8 +742,9 @@ export default function App() {
     if (isHost) {
       setStatus('connected')
       sync()
+      send({ type: 'aiHealth', health: aiHealthRef.current })
     } else setStatus(everConnectedRef.current ? 'reconnecting' : 'waiting')
-  }, [sync])
+  }, [sync, send])
 
   const startPhoneAttempt = useCallback(() => {
     if (!reconnectWantedRef.current || !/^\d{5}$/.test(entryCode)) return
@@ -665,7 +812,9 @@ export default function App() {
     const check = window.setInterval(() => {
       const conn = connRef.current
       if (!conn?.open) return
-      if (Date.now() - lastReceivedRef.current > 30_000) {
+      // Safari suspends background pages and timers; a short 30s expiry can
+      // disconnect a healthy drawing session as soon as the tablet wakes.
+      if (Date.now() - lastReceivedRef.current > 120_000) {
         conn.close()
       } else send({ type: 'ping' }, true)
     }, 5000)
@@ -840,7 +989,9 @@ export default function App() {
     return () => clearInterval(timer)
   }, [playing, project.fps])
 
-  const exportImage = () => {
+  const exportImage = async () => {
+    try { await waitForRasterFrames(projectRef.current) }
+    catch { setToast('生成画像を読み込めず書き出せませんでした'); return }
     const canvas = document.createElement('canvas')
     renderProject(canvas, projectRef.current, projectRef.current.activeFrame)
     canvas.toBlob(blob => { if (blob) downloadBlob(blob, `${projectRef.current.name}-frame-${projectRef.current.activeFrame + 1}.png`) }, 'image/png')
@@ -858,6 +1009,7 @@ export default function App() {
       small.width = 640; small.height = 360
       const ctx = small.getContext('2d', { willReadFrequently: true })!
       const doc = projectRef.current
+      await waitForRasterFrames(doc)
       for (let i = 0; i < doc.frames.length; i++) {
         renderProject(source, doc, i)
         ctx.drawImage(source, 0, 0, small.width, small.height)
@@ -892,6 +1044,55 @@ export default function App() {
   }
 
   const choose = (action: Action) => execute(action)
+  const requestAssist = (form: AssistForm) => {
+    const doc = projectRef.current
+    const request: AssistRequest = { ...form, id: crypto.randomUUID(),
+      frameId: doc.frames[doc.activeFrame].id, layerId: doc.activeLayer }
+    setAiResult(null)
+    if (roleRef.current === 'pc') {
+      void runAiRef.current(request, false)
+      return
+    }
+    aiActiveRequestRef.current = request.id
+    if (!send({ type: 'aiRequest', request })) {
+      aiActiveRequestRef.current = null
+      setAiResult({ id: request.id, message: '', error: 'PCに接続できません。接続を復旧して再実行してください。' })
+      return
+    }
+    setAiBusy(true)
+    if (aiTimeoutRef.current !== null) clearTimeout(aiTimeoutRef.current)
+    aiTimeoutRef.current = window.setTimeout(() => {
+      aiTimeoutRef.current = null
+      aiActiveRequestRef.current = null
+      setAiBusy(false)
+      setAiResult({ id: request.id, message: '', error: 'PCから応答がありません。接続を確認して再実行してください。' })
+    }, 180_000)
+  }
+  const acceptAssist = () => {
+    if (!aiResult?.preview || aiResult.error) return
+    if (roleRef.current === 'pc') acceptAiRef.current(aiResult.id)
+    else if (send({ type: 'aiAccept', id: aiResult.id })) {
+      setAiBusy(true)
+      if (aiTimeoutRef.current !== null) clearTimeout(aiTimeoutRef.current)
+      aiTimeoutRef.current = window.setTimeout(() => {
+        aiTimeoutRef.current = null
+        aiActiveRequestRef.current = null
+        setAiBusy(false)
+        setAiResult({ id: aiResult.id, message: '', error: '採用結果を確認できませんでした。PC画面で作品を確認してください。' })
+      }, 30_000)
+    } else setAiResult({ id: aiResult.id, message: '', error: '接続が切れました。再接続してください。' })
+  }
+  const discardAssist = () => {
+    if (aiResult?.id) {
+      if (roleRef.current === 'pc') discardAiRef.current(aiResult.id)
+      else send({ type: 'aiDiscard', id: aiResult.id })
+    }
+    aiActiveRequestRef.current = null
+    if (aiTimeoutRef.current !== null) window.clearTimeout(aiTimeoutRef.current)
+    aiTimeoutRef.current = null
+    setAiBusy(false)
+    setAiResult(null)
+  }
   const activeFrame = playing ? playhead : project.activeFrame
   const layers = [...project.layers].reverse()
   const connected = status === 'connected'
@@ -954,6 +1155,7 @@ export default function App() {
       <div className="header-actions">
         <span className={`connection-pill ${connected ? 'is-connected' : isPhone ? 'is-reconnecting' : ''}`}><span className="pulse-dot" /> {connected ? 'LIVE接続中' : isPhone ? '再接続中' : '待機中'}</span>
         {!isPhone && <Button className="outline tiny" onClick={() => { navigator.clipboard?.writeText(code).then(() => setToast('コードをコピーしました')).catch(() => setToast(`接続コード: ${code}`)) }}><Link2 size={15} /> <span className="hide-small">接続コード</span> {code || '·····'}</Button>}
+        <Button className="ai-entry tiny" onClick={() => setShowAi(true)}><Sparkles size={16} /><span>AIアシスト</span></Button>
         <IconButton icon={CircleHelp} title="使い方" onClick={() => setShowHelp(true)} />
         <Button className="primary tiny export-main" onClick={() => setShowExport(true)}><Download size={16} /> <span>書き出し</span></Button>
       </div>
@@ -1043,6 +1245,10 @@ export default function App() {
       <div className="session-actions"><span><span className="pulse-dot" /> {status === 'ready' ? '接続待機中' : status === 'creating' ? '発行中' : '再接続が必要です'}</span><button onClick={createHost} title="コードを再発行"><RefreshCw size={16} /></button></div></div>}
 
     {pending && role === 'pc' && <div className="modal-backdrop"><div className="dialog approval"><div className="dialog-icon"><ShieldCheck size={25} /></div><h3>スマホから接続リクエスト</h3><p>コードを入力したスマホをこのスタジオに接続しますか？</p><div className="dialog-actions"><Button onClick={() => { pending.close(); setPending(null) }} className="outline">拒否する</Button><Button className="primary" onClick={acceptPending}>接続を許可 <Check size={16} /></Button></div></div></div>}
+
+    {showAi && <AiDialog role={isPhone ? 'phone' : 'pc'} connected={connected} busy={aiBusy}
+      result={aiResult} health={aiHealth} onRequest={requestAssist} onApply={acceptAssist}
+      onDiscard={discardAssist} onModelLoad={handleModelLoad} onClose={() => setShowAi(false)} />}
 
     {showExport && <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setShowExport(false) }}><div className="dialog export-dialog"><button className="dialog-close" onClick={() => setShowExport(false)}><X size={19} /></button><div className="dialog-icon"><Download size={24} /></div><h3>作品を書き出す</h3><p>つくったアニメーションを保存しましょう。</p>
       <button className="export-option" onClick={exportGif} disabled={exporting}><span className="export-option-icon"><Film size={20} /></span><span><b>アニメーション GIF</b><small>すべてのフレームを動く画像に / 640×360</small></span><ArrowRight size={18} /></button>

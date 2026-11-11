@@ -5,3 +5,6 @@ dist/
 .vercel/
 *.log
 *.tsbuildinfo
+__pycache__/
+*.pyc
+tools/rife/

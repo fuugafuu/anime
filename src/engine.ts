@@ -13,7 +13,7 @@ export type Stroke = {
   points: Point[]
 }
 export type Layer = { id: string; name: string; visible: boolean; locked: boolean }
-export type Frame = { id: string; tracks: Record<string, Stroke[]> }
+export type Frame = { id: string; tracks: Record<string, Stroke[]>; image?: string }
 export type Project = {
   name: string
   fps: number
@@ -44,7 +44,7 @@ export function addFrame(doc: Project, duplicate = false, frameId: string = uid(
   const source = doc.frames[doc.activeFrame]
   const tracks = duplicate ? structuredClone(source.tracks) : {}
   const next = [...doc.frames]
-  next.splice(doc.activeFrame + 1, 0, { id: frameId, tracks })
+  next.splice(doc.activeFrame + 1, 0, { id: frameId, tracks, image: duplicate ? source.image : undefined })
   return { ...doc, frames: next, activeFrame: doc.activeFrame + 1 }
 }
 
@@ -171,17 +171,56 @@ export function drawStroke(ctx: CanvasRenderingContext2D, stroke: Stroke) {
   ctx.restore()
 }
 
+const rasterCache = new Map<string, HTMLImageElement>()
+const renderTokens = new WeakMap<HTMLCanvasElement, symbol>()
+// Live pencil input can repaint dozens of times per second. Reuse the layer
+// surface instead of allocating a 1280x720 canvas for every visible layer.
+const layerSurfaces = new WeakMap<CanvasRenderingContext2D, HTMLCanvasElement>()
+
+function raster(source: string) {
+  let img = rasterCache.get(source)
+  if (!img) {
+    img = new window.Image()
+    rasterCache.set(source, img)
+    img.src = source
+    if (rasterCache.size > 64) rasterCache.delete(rasterCache.keys().next().value!)
+  }
+  return img
+}
+
+export async function waitForRasterFrames(doc: Project): Promise<void> {
+  await Promise.all(doc.frames.filter(frame => frame.image).map(frame => new Promise<void>((resolve, reject) => {
+    const img = raster(frame.image!)
+    if (img.complete) {
+      if (img.naturalWidth) resolve()
+      else reject(Error('生成画像を読み込めません'))
+      return
+    }
+    img.addEventListener('load', () => resolve(), { once: true })
+    img.addEventListener('error', () => reject(Error('生成画像を読み込めません')), { once: true })
+  })))
+}
+
 function renderLayers(ctx: CanvasRenderingContext2D, project: Project, index: number, opacity = 1, extra?: { layer: string; stroke: Stroke }) {
   const frame = project.frames[index]
   if (!frame) return
   ctx.save()
   ctx.globalAlpha = opacity
-  for (const layer of project.layers) {
-    if (!layer.visible) continue
-    const buffer = document.createElement('canvas')
+  if (frame.image) {
+    const img = raster(frame.image)
+    if (img.complete && img.naturalWidth) ctx.drawImage(img, 0, 0, WIDTH, HEIGHT)
+  }
+  let buffer = layerSurfaces.get(ctx)
+  if (!buffer) {
+    buffer = document.createElement('canvas')
     buffer.width = WIDTH
     buffer.height = HEIGHT
-    const layerCtx = buffer.getContext('2d', { willReadFrequently: true })!
+    layerSurfaces.set(ctx, buffer)
+  }
+  const layerCtx = buffer.getContext('2d', { willReadFrequently: true })!
+  for (const layer of project.layers) {
+    if (!layer.visible) continue
+    layerCtx.clearRect(0, 0, WIDTH, HEIGHT)
     for (const stroke of frame.tracks[layer.id] || []) drawStroke(layerCtx, stroke)
     if (extra?.layer === layer.id) drawStroke(layerCtx, extra.stroke)
     ctx.drawImage(buffer, 0, 0)
@@ -191,6 +230,19 @@ function renderLayers(ctx: CanvasRenderingContext2D, project: Project, index: nu
 
 export function renderProject(canvas: HTMLCanvasElement, project: Project, index: number,
   options: { onion?: boolean; grid?: boolean; extra?: { layer: string; stroke: Stroke }; transparent?: boolean } = {}) {
+  const token = Symbol()
+  renderTokens.set(canvas, token)
+  const relevant = options.onion ? [index-1, index, index+1] : [index]
+  for (const n of relevant) {
+    const src = project.frames[n]?.image
+    if (!src) continue
+    const img = raster(src)
+    if (!img.complete) {
+      img.addEventListener('load', () => {
+        if (renderTokens.get(canvas) === token) renderProject(canvas, project, index, options)
+      }, { once: true })
+    }
+  }
   if (canvas.width !== WIDTH || canvas.height !== HEIGHT) { canvas.width = WIDTH; canvas.height = HEIGHT }
   const ctx = canvas.getContext('2d')!
   ctx.clearRect(0, 0, WIDTH, HEIGHT)
