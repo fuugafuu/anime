@@ -485,8 +485,7 @@ export default function App() {
   const executeRef = useRef(execute)
   executeRef.current = execute
 
-  // Inference always runs on the host PC. The phone only sends a small request
-  // and receives a compressed preview; candidates remain on the PC until accepted.
+  // Inference runs inside the host PC's browser Worker; phones only send requests.
   const runAi = useCallback(async (request: AssistRequest, fromPhone: boolean) => {
     if (roleRef.current !== 'pc') return
     if (aiBusyRef.current) {
@@ -556,7 +555,7 @@ export default function App() {
     let active = true
     const poll = async () => {
       let health: AiHealth | null = null
-      try { health = await getAiHealth() } catch { /* Service is optional. */ }
+      try { health = await getAiHealth() } catch { /* Initial browser capability detection can fail. */ }
       if (!active) return
       aiHealthRef.current = health
       setAiHealth(health)
@@ -569,7 +568,10 @@ export default function App() {
 
   const handleModelLoad = useCallback(async (source: ModelSource, directory = '') => {
     if (roleRef.current !== 'pc') throw Error('モデルの読み込みはPCで操作してください。')
-    const message = await loadAiModel(source, directory)
+    const message = await loadAiModel(source, directory, value => {
+      setAiHealth(current => ({ ...(current || { ready: true, neuralReady: false,
+        neuralInstalled: true, neuralModel: null, detectedModel: 'RIFE v4.9' }), progress: value }))
+    })
     const health = await getAiHealth()
     aiHealthRef.current = health
     setAiHealth(health)
